@@ -18,6 +18,7 @@ from config import (
     SESSION_TIMEOUT_SECONDS,
 )
 from aegistrap.core.session_manager import session_manager, ai_bridge, AttackerSession
+from aegistrap.core.pipeline import command_pipeline
 
 logger = logging.getLogger("aegistrap.ftp")
 
@@ -145,6 +146,9 @@ class FTPClientHandler:
                 self._ip, self._port, "FTP"
             )
 
+            # === PIPELINE: Session Start ===
+            await command_pipeline.on_session_start(self._session)
+
             # Command processing loop
             while not self._session.is_expired():
                 try:
@@ -188,6 +192,8 @@ class FTPClientHandler:
             logger.error(f"[FTP] Error from {self._ip}:{self._port}: {e}")
         finally:
             if self._session:
+                # === PIPELINE: Session End ===
+                await command_pipeline.on_session_end(self._session)
                 await session_manager.destroy_session(self._ip, self._port)
             try:
                 self._writer.close()
@@ -277,12 +283,10 @@ class FTPClientHandler:
             self._session.username = "anonymous"
             response = f"{FTP_LOGIN_OK} Login successful."
             await self._send(response)
-            await self._log_interaction(
-                f"LOGIN: {self._username}:{password}", response
+            await command_pipeline.process_auth_attempt(
+                self._session, "anonymous", password, True, self._log_callback
             )
-            logger.info(
-                f"[FTP] Anonymous login accepted from {self._ip}:{self._port}"
-            )
+            logger.info(f"[FTP] Anonymous login accepted from {self._ip}:{self._port}")
             return
 
         # Check valid credentials
@@ -292,8 +296,8 @@ class FTPClientHandler:
             self._session.username = self._username
             response = f"{FTP_LOGIN_OK} Login successful."
             await self._send(response)
-            await self._log_interaction(
-                f"LOGIN: {self._username}:{password}", response
+            await command_pipeline.process_auth_attempt(
+                self._session, self._username, password, True, self._log_callback
             )
             logger.info(
                 f"[FTP] Auth accepted (valid creds): {self._username}:{password} "
@@ -311,8 +315,8 @@ class FTPClientHandler:
             self._session.username = self._username
             response = f"{FTP_LOGIN_OK} Login successful."
             await self._send(response)
-            await self._log_interaction(
-                f"LOGIN: {self._username}:{password}", response
+            await command_pipeline.process_auth_attempt(
+                self._session, self._username, password, True, self._log_callback
             )
             logger.info(
                 f"[FTP] Auth accepted (after {self._failed_attempts} failures): "
@@ -323,8 +327,8 @@ class FTPClientHandler:
         # Reject
         response = f"{FTP_LOGIN_FAIL} Login incorrect."
         await self._send(response)
-        await self._log_interaction(
-            f"LOGIN FAILED: {self._username}:{password}", response
+        await command_pipeline.process_auth_attempt(
+            self._session, self._username, password, False, self._log_callback
         )
         logger.info(
             f"[FTP] Auth rejected (attempt {self._failed_attempts}): "
@@ -493,20 +497,18 @@ class FTPClientHandler:
                 await self._log_interaction(f"RETR {filename}", response)
 
     async def _cmd_stor(self, args: str, raw: str) -> None:
-        """Handle STOR command - simulate file upload capture."""
+        """Handle STOR command - capture uploaded file and run YARA scan."""
         filename = args.strip()
         logger.info(
             f"[FTP] STOR (upload attempt): {filename} from {self._ip}:{self._port}"
         )
 
-        await self._send(
-            f"{FTP_FILE_OK} Ok to send data."
-        )
+        await self._send(f"{FTP_FILE_OK} Ok to send data.")
 
         # Read uploaded data (up to 1MB to prevent abuse)
         uploaded_data = b""
         try:
-            while len(uploaded_data) < 1048576:  # 1MB max
+            while len(uploaded_data) < 1048576:
                 chunk = await asyncio.wait_for(
                     self._reader.read(4096), timeout=10
                 )
@@ -519,14 +521,13 @@ class FTPClientHandler:
         response = f"{FTP_TRANSFER_OK} Transfer complete."
         await self._send(response)
 
-        # Log the upload with size info
-        await self._log_interaction(
-            f"STOR {filename} ({len(uploaded_data)} bytes uploaded)",
-            f"Upload captured: {filename} size={len(uploaded_data)}",
-        )
-
-        # Track the file in the virtual filesystem
+        # === PIPELINE: Scan uploaded file with YARA + threat feeds ===
         if self._session:
+            await command_pipeline.process_file_upload(
+                self._session, filename, uploaded_data, self._log_callback
+            )
+
+            # Track the file in the virtual filesystem
             path = f"{self._current_dir.rstrip('/')}/{filename}"
             self._session.virtual_fs.files[path] = f"(uploaded: {len(uploaded_data)} bytes)"
 

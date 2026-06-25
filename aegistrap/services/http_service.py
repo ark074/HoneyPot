@@ -20,6 +20,7 @@ from config import (
     HTTP_SERVER_HEADER,
 )
 from aegistrap.core.session_manager import session_manager, ai_bridge
+from aegistrap.core.pipeline import command_pipeline
 
 logger = logging.getLogger("aegistrap.http")
 
@@ -283,7 +284,7 @@ class HTTPHoneypotHandler:
         return response
 
     async def _log_request(self, request: web.Request, response_body: str) -> None:
-        """Log HTTP request details for threat intelligence."""
+        """Log HTTP request details through the unified pipeline."""
         if not self._log_callback:
             return
 
@@ -308,12 +309,18 @@ class HTTPHoneypotHandler:
         # Create a temporary session for logging
         session = await session_manager.create_session(peername, port, "HTTP")
         try:
+            # === PIPELINE: Session start with HTTP fingerprinting ===
+            await command_pipeline.on_session_start(
+                session, http_headers=dict(request.headers)
+            )
+
             await self._log_callback(
                 session=session,
                 input_received=input_received,
-                ai_response=response_body[:500],  # Truncate large HTML responses
+                ai_response=response_body[:500],
             )
         finally:
+            await command_pipeline.on_session_end(session)
             await session_manager.destroy_session(peername, port)
 
     async def _handle_root(self, request: web.Request) -> web.Response:

@@ -31,6 +31,7 @@ from config import (
     OLLAMA_HOST, OLLAMA_MODEL,
     RATE_LIMIT_REQUESTS_PER_MINUTE, SESSION_TIMEOUT_SECONDS, LOG_FILE,
 )
+from aegistrap.core.pipeline import command_pipeline
 from aegistrap.core.logger import (
     setup_console_logging, structured_logger, log_interaction,
 )
@@ -186,6 +187,10 @@ async def start_all_services() -> None:
 
     # Initialize advanced modules (graceful degradation)
     await initialize_advanced_modules()
+
+    # Initialize unified command pipeline
+    await command_pipeline.initialize()
+    logger.info("[Boot] Unified command pipeline initialized")
 
     # Start Dashboard API
     await start_dashboard_api()

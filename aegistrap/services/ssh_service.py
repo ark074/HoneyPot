@@ -2,8 +2,8 @@
 AegisTrap SSH Honeypot Service
 ================================
 Provides a realistic SSH server on port 2222 using AsyncSSH.
-Handles authentication with configurable credential acceptance,
-presents a Linux banner, and relays commands to the AI engine.
+Fully integrated with the unified command pipeline for security
+analysis, profiling, MITRE mapping, and real-time dashboard events.
 """
 
 import asyncio
@@ -18,7 +18,8 @@ from config import (
     VALID_CREDENTIALS,
     MAX_FAILED_ATTEMPTS_BEFORE_ACCEPT,
 )
-from aegistrap.core.session_manager import session_manager, ai_bridge, AttackerSession
+from aegistrap.core.session_manager import session_manager, AttackerSession
+from aegistrap.core.pipeline import command_pipeline
 
 logger = logging.getLogger("aegistrap.ssh")
 
@@ -35,7 +36,6 @@ class SSHServerHandler(asyncssh.SSHServer):
         self._failed_attempts: int = 0
         self._username: str = ""
         self._peername: Optional[tuple] = None
-        self._session: Optional[AttackerSession] = None
         self._log_callback = None
 
     def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
@@ -52,10 +52,7 @@ class SSHServerHandler(asyncssh.SSHServer):
         logger.info(f"[SSH] Connection closed from {ip}:{port}")
 
     def begin_auth(self, username: str) -> bool:
-        """
-        Called when authentication begins.
-        Returns True to indicate authentication is required.
-        """
+        """Called when authentication begins. Returns True to require auth."""
         self._username = username
         return True
 
@@ -97,24 +94,57 @@ class SSHServerHandler(asyncssh.SSHServer):
         return False
 
 
-class SSHSessionHandler(asyncssh.SSHServerProcess):
+async def _handle_ssh_process(process: asyncssh.SSHServerProcess, log_callback=None):
     """
-    Handles an authenticated SSH session's interactive shell.
-    Relays all commands to the AI Context Bridge and returns
-    simulated terminal output.
+    Coroutine that handles a new SSH process (shell session).
+    Creates session, triggers pipeline on_session_start, then enters
+    the interactive command loop routed through the unified pipeline.
     """
+    peername = process.get_extra_info("peername")
 
-    def __init__(self, process, session: AttackerSession, log_callback):
-        self._process = process
-        self._session = session
-        self._log_callback = log_callback
+    if peername:
+        ip, port = peername[0], peername[1]
+    else:
+        ip, port = "unknown", 0
 
-    async def handle(self) -> None:
-        """Main interactive shell loop for the SSH session."""
-        session = self._session
-        process = self._process
+    # Get SSH client version for fingerprinting
+    ssh_client_version = ""
+    try:
+        conn = process.get_extra_info("connection")
+        if conn and hasattr(conn, "get_extra_info"):
+            ssh_client_version = conn.get_extra_info("client_version") or ""
+    except Exception:
+        pass
 
-        # Send login banner
+    # Get or create session
+    session = await session_manager.get_session(ip, port)
+    if not session:
+        session = await session_manager.create_session(ip, port, "SSH")
+
+    # Set the authenticated username
+    session.authenticated = True
+    try:
+        session.username = process.get_extra_info("username") or "root"
+    except Exception:
+        session.username = "root"
+
+    logger.info(
+        f"[SSH] Shell session started for {session.username}@{ip}:{port} "
+        f"(session: {session.session_id})"
+    )
+
+    # === PIPELINE: Session Start (GeoIP, fingerprint, threat feeds, honeytokens) ===
+    await command_pipeline.on_session_start(
+        session, ssh_client_version=ssh_client_version
+    )
+
+    # === PIPELINE: Log auth success ===
+    await command_pipeline.process_auth_attempt(
+        session, session.username, "(accepted)", True, log_callback
+    )
+
+    try:
+        # Send login banner (MOTD)
         process.stdout.write(
             "Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-91-generic x86_64)\r\n"
             "\r\n"
@@ -139,9 +169,8 @@ class SSHSessionHandler(asyncssh.SSHServerProcess):
             process.stdout.write(prompt)
 
             try:
-                # Read a line from the attacker
                 line = await asyncio.wait_for(
-                    process.stdin.readline(), timeout=300  # 5 min idle timeout
+                    process.stdin.readline(), timeout=300
                 )
             except asyncio.TimeoutError:
                 process.stdout.write("\r\nConnection timed out.\r\n")
@@ -153,7 +182,6 @@ class SSHSessionHandler(asyncssh.SSHServerProcess):
                 break
 
             command = line.strip()
-
             if not command:
                 continue
 
@@ -162,74 +190,42 @@ class SSHSessionHandler(asyncssh.SSHServerProcess):
                 process.stdout.write("logout\r\n")
                 break
 
-            # Generate AI response for the command
-            try:
-                response = await ai_bridge.generate_response(session, command)
-            except Exception as e:
-                logger.error(f"[SSH] AI bridge error: {e}")
-                response = f"bash: {command}: command not found"
+            # === PIPELINE: Process command through full analysis chain ===
+            pipeline_result = await command_pipeline.process_command(
+                session, command, log_callback
+            )
 
-            # Send response to attacker
-            if response:
-                # Ensure proper line endings for SSH terminal
-                formatted = response.replace("\n", "\r\n")
+            # Handle blocked commands (rate limit, session expired)
+            if pipeline_result.blocked:
+                if pipeline_result.session_expired:
+                    process.stdout.write(
+                        "\r\nSession expired. Connection closed.\r\n"
+                    )
+                    break
+                elif pipeline_result.response:
+                    formatted = pipeline_result.response.replace("\n", "\r\n")
+                    if not formatted.endswith("\r\n"):
+                        formatted += "\r\n"
+                    process.stdout.write(formatted)
+                continue
+
+            # Send AI-generated response to attacker
+            if pipeline_result.response:
+                formatted = pipeline_result.response.replace("\n", "\r\n")
                 if not formatted.endswith("\r\n"):
                     formatted += "\r\n"
                 process.stdout.write(formatted)
 
-            # Log the interaction
-            if self._log_callback:
-                await self._log_callback(
-                    session=session,
-                    input_received=command,
-                    ai_response=response,
-                )
-
-            # Update session activity
-            session.update_activity()
-
-        # Close the process
+    except (ConnectionResetError, BrokenPipeError):
+        logger.info(f"[SSH] Connection reset from {ip}:{port}")
+    except Exception as e:
+        logger.error(f"[SSH] Unexpected error from {ip}:{port}: {e}")
+    finally:
+        # === PIPELINE: Session End (finalize profiler, recorder, etc.) ===
+        await command_pipeline.on_session_end(session)
+        await session_manager.destroy_session(ip, port)
         process.close()
-
-
-async def _handle_ssh_process(process: asyncssh.SSHServerProcess, log_callback=None):
-    """
-    Coroutine that handles a new SSH process (shell session).
-    Creates or retrieves the session and launches the interactive handler.
-    """
-    conn = process.get_extra_info("connection")
-    peername = process.get_extra_info("peername")
-
-    if peername:
-        ip, port = peername[0], peername[1]
-    else:
-        ip, port = "unknown", 0
-
-    # Get or create session
-    session = await session_manager.get_session(ip, port)
-    if not session:
-        session = await session_manager.create_session(ip, port, "SSH")
-
-    # Set the authenticated username
-    session.authenticated = True
-    # Try to get the username from the connection
-    try:
-        session.username = process.get_extra_info("username") or "root"
-    except Exception:
-        session.username = "root"
-
-    logger.info(
-        f"[SSH] Shell session started for {session.username}@{ip}:{port} "
-        f"(session: {session.session_id})"
-    )
-
-    # Run the interactive handler
-    handler = SSHSessionHandler(process, session, log_callback)
-    await handler.handle()
-
-    # Cleanup
-    await session_manager.destroy_session(ip, port)
-    logger.info(f"[SSH] Session ended for {ip}:{port}")
+        logger.info(f"[SSH] Session ended for {ip}:{port}")
 
 
 async def start_ssh_server(

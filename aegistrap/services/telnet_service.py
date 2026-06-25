@@ -2,8 +2,8 @@
 AegisTrap Telnet Honeypot Service
 ===================================
 Provides a realistic Telnet server on port 23 using asyncio streams.
-Handles login prompts, credential acceptance, and relays commands
-to the AI engine for dynamic response generation.
+Fully integrated with the unified command pipeline for real-time
+analysis, profiling, and threat intelligence enrichment.
 """
 
 import asyncio
@@ -17,24 +17,26 @@ from config import (
     MAX_FAILED_ATTEMPTS_BEFORE_ACCEPT,
     SESSION_TIMEOUT_SECONDS,
 )
-from aegistrap.core.session_manager import session_manager, ai_bridge, AttackerSession
+from aegistrap.core.session_manager import session_manager, AttackerSession
+from aegistrap.core.pipeline import command_pipeline
 
 logger = logging.getLogger("aegistrap.telnet")
 
 # Telnet protocol constants
-IAC = bytes([255])   # Interpret As Command
+IAC = bytes([255])
 WILL = bytes([251])
 WONT = bytes([252])
 DO = bytes([253])
 DONT = bytes([254])
-SGA = bytes([3])     # Suppress Go Ahead
-ECHO = bytes([1])    # Echo
+SGA = bytes([3])
+ECHO = bytes([1])
 
 
 class TelnetClientHandler:
     """
     Handles a single Telnet client connection.
-    Manages the login sequence, interactive shell, and session lifecycle.
+    Manages the login sequence, interactive shell, and session lifecycle
+    with full pipeline integration.
     """
 
     def __init__(
@@ -49,12 +51,10 @@ class TelnetClientHandler:
         self._session: Optional[AttackerSession] = None
         self._ip: str = "unknown"
         self._port: int = 0
+        self._username: str = "root"
 
     async def handle(self) -> None:
-        """
-        Main entry point for handling a telnet connection.
-        Performs login then enters interactive shell mode.
-        """
+        """Main entry point for handling a telnet connection."""
         peername = self._writer.get_extra_info("peername")
         self._ip = peername[0] if peername else "unknown"
         self._port = peername[1] if peername else 0
@@ -72,11 +72,20 @@ class TelnetClientHandler:
                 await self._writer.drain()
                 return
 
-            # Create session and enter shell
+            # Create session
             self._session = await session_manager.create_session(
                 self._ip, self._port, "Telnet"
             )
             self._session.authenticated = True
+            self._session.username = self._username
+
+            # === PIPELINE: Session Start ===
+            await command_pipeline.on_session_start(self._session)
+
+            # === PIPELINE: Log successful auth ===
+            await command_pipeline.process_auth_attempt(
+                self._session, self._username, "(accepted)", True, self._log_callback
+            )
 
             # Send login success banner
             await self._send_motd()
@@ -91,8 +100,9 @@ class TelnetClientHandler:
         except Exception as e:
             logger.error(f"[Telnet] Unexpected error from {self._ip}:{self._port}: {e}")
         finally:
-            # Cleanup
+            # === PIPELINE: Session End ===
             if self._session:
+                await command_pipeline.on_session_end(self._session)
                 await session_manager.destroy_session(self._ip, self._port)
             try:
                 self._writer.close()
@@ -102,19 +112,12 @@ class TelnetClientHandler:
             logger.info(f"[Telnet] Connection closed from {self._ip}:{self._port}")
 
     async def _negotiate(self) -> None:
-        """Send Telnet option negotiations for proper terminal handling."""
-        # Tell client we will echo (so password input works)
+        """Send Telnet option negotiations."""
         self._writer.write(IAC + WILL + ECHO)
-        # Tell client we will suppress go-ahead
         self._writer.write(IAC + WILL + SGA)
-        # Request client to suppress go-ahead
         self._writer.write(IAC + DO + SGA)
         await self._writer.drain()
-
-        # Give client a moment to respond to negotiations
         await asyncio.sleep(0.1)
-
-        # Consume any negotiation responses from client
         try:
             if self._reader._buffer:
                 await asyncio.wait_for(self._reader.read(1024), timeout=0.5)
@@ -122,10 +125,7 @@ class TelnetClientHandler:
             pass
 
     async def _login_sequence(self) -> bool:
-        """
-        Handle the login prompt sequence.
-        Returns True if authentication succeeds, False otherwise.
-        """
+        """Handle login prompt sequence. Returns True if auth succeeds."""
         failed_attempts = 0
         max_total_attempts = MAX_FAILED_ATTEMPTS_BEFORE_ACCEPT + 2
 
@@ -140,11 +140,9 @@ class TelnetClientHandler:
                 return False
             username = username.strip()
 
-            # Prompt for password (no echo)
+            # Prompt for password
             self._writer.write(b"Password: ")
             await self._writer.drain()
-
-            # Disable echo for password
             self._writer.write(IAC + WILL + ECHO)
             await self._writer.drain()
 
@@ -158,35 +156,30 @@ class TelnetClientHandler:
             self._writer.write(b"\r\n")
             await self._writer.drain()
 
-            # Log the credential attempt
-            if self._log_callback:
-                # Create a temporary session for logging auth attempts
-                temp_session = await session_manager.create_session(
-                    self._ip, self._port, "Telnet"
-                )
-                await self._log_callback(
-                    session=temp_session,
-                    input_received=f"LOGIN: {username}:{password}",
-                    ai_response="(authentication attempt)",
-                )
-                await session_manager.destroy_session(self._ip, self._port)
+            # Log credential attempt via pipeline
+            temp_session = await session_manager.create_session(
+                self._ip, self._port, "Telnet"
+            )
+            success = False
 
             # Check credentials
             if (username, password) in VALID_CREDENTIALS:
+                success = True
+            else:
+                failed_attempts += 1
+                if failed_attempts > MAX_FAILED_ATTEMPTS_BEFORE_ACCEPT:
+                    success = True
+
+            # === PIPELINE: Log auth attempt ===
+            await command_pipeline.process_auth_attempt(
+                temp_session, username, password, success, self._log_callback
+            )
+            await session_manager.destroy_session(self._ip, self._port)
+
+            if success:
                 logger.info(
-                    f"[Telnet] Auth accepted (valid creds): {username}:{password} "
+                    f"[Telnet] Auth accepted: {username}:{password} "
                     f"from {self._ip}:{self._port}"
-                )
-                self._username = username
-                return True
-
-            failed_attempts += 1
-
-            # Accept any credentials after threshold
-            if failed_attempts > MAX_FAILED_ATTEMPTS_BEFORE_ACCEPT:
-                logger.info(
-                    f"[Telnet] Auth accepted (after {failed_attempts} failures): "
-                    f"{username}:{password} from {self._ip}:{self._port}"
                 )
                 self._username = username
                 return True
@@ -223,12 +216,8 @@ class TelnetClientHandler:
         await self._writer.drain()
 
     async def _shell_loop(self) -> None:
-        """
-        Interactive shell loop. Displays prompt, reads commands,
-        and returns AI-generated responses.
-        """
+        """Interactive shell loop routed through the unified pipeline."""
         session = self._session
-        session.username = getattr(self, "_username", "root")
 
         while not session.is_expired():
             # Display prompt
@@ -259,43 +248,35 @@ class TelnetClientHandler:
                 await self._writer.drain()
                 break
 
-            # Generate AI response
-            try:
-                response = await ai_bridge.generate_response(session, command)
-            except Exception as e:
-                logger.error(f"[Telnet] AI bridge error: {e}")
-                response = f"bash: {command}: command not found"
+            # === PIPELINE: Process command through full analysis chain ===
+            pipeline_result = await command_pipeline.process_command(
+                session, command, self._log_callback
+            )
+
+            # Handle blocked commands
+            if pipeline_result.blocked:
+                if pipeline_result.session_expired:
+                    self._writer.write(b"\r\nSession expired.\r\n")
+                    await self._writer.drain()
+                    break
+                elif pipeline_result.response:
+                    formatted = pipeline_result.response.replace("\n", "\r\n")
+                    if not formatted.endswith("\r\n"):
+                        formatted += "\r\n"
+                    self._writer.write(formatted.encode())
+                    await self._writer.drain()
+                continue
 
             # Send response
-            if response:
-                formatted = response.replace("\n", "\r\n")
+            if pipeline_result.response:
+                formatted = pipeline_result.response.replace("\n", "\r\n")
                 if not formatted.endswith("\r\n"):
                     formatted += "\r\n"
                 self._writer.write(formatted.encode())
                 await self._writer.drain()
 
-            # Log the interaction
-            if self._log_callback:
-                await self._log_callback(
-                    session=session,
-                    input_received=command,
-                    ai_response=response,
-                )
-
-            # Update session activity
-            session.update_activity()
-
     async def _read_line(self, echo: bool = True) -> Optional[str]:
-        """
-        Read a line of input from the telnet client character by character.
-        Handles backspace and provides optional local echo.
-
-        Args:
-            echo: Whether to echo characters back to the client.
-
-        Returns:
-            The input line as a string, or None if connection closed.
-        """
+        """Read a line of input character by character with optional echo."""
         line_buffer = []
 
         while True:
@@ -313,36 +294,29 @@ class TelnetClientHandler:
 
             # Handle Telnet IAC sequences
             if byte == 255:
-                # Read the command byte
                 try:
                     cmd_data = await self._reader.read(1)
                     if cmd_data and cmd_data[0] in (251, 252, 253, 254):
-                        # Option negotiation - read option byte
                         await self._reader.read(1)
                 except Exception:
                     pass
                 continue
 
-            # Handle Enter (CR or LF)
+            # Handle Enter
             if byte in (13, 10):
-                # Consume trailing LF after CR if present
                 if byte == 13:
                     try:
                         next_byte = await asyncio.wait_for(
                             self._reader.read(1), timeout=0.1
                         )
-                        if next_byte and next_byte[0] != 10:
-                            # Not a LF, put it back conceptually (ignore for simplicity)
-                            pass
                     except asyncio.TimeoutError:
                         pass
-
                 if echo:
                     self._writer.write(b"\r\n")
                     await self._writer.drain()
                 return "".join(line_buffer)
 
-            # Handle Backspace (BS or DEL)
+            # Handle Backspace
             if byte in (8, 127):
                 if line_buffer:
                     line_buffer.pop()
@@ -351,7 +325,7 @@ class TelnetClientHandler:
                         await self._writer.drain()
                 continue
 
-            # Regular printable character
+            # Regular character
             if 32 <= byte < 127:
                 line_buffer.append(chr(byte))
                 if echo:
@@ -364,17 +338,7 @@ async def start_telnet_server(
     port: int = TELNET_PORT,
     log_callback: Optional[Callable[..., Awaitable]] = None,
 ) -> asyncio.Server:
-    """
-    Start the Telnet honeypot server.
-
-    Args:
-        host: Bind address (default: all interfaces).
-        port: Listen port (default: 23).
-        log_callback: Async callback for logging interactions.
-
-    Returns:
-        The asyncio.Server instance for lifecycle management.
-    """
+    """Start the Telnet honeypot server."""
 
     async def client_connected(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
