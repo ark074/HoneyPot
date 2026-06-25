@@ -1,0 +1,104 @@
+###############################################################################
+# AegisTrap - Docker Compose Orchestration
+# 
+# Two microservices:
+# 1. ollama-service: Local LLM runtime (llama3:8b)
+# 2. aegistrap-app: Multi-service honeypot application
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f        # Follow logs
+#   docker-compose down           # Stop and remove containers
+###############################################################################
+
+version: "3.9"
+
+services:
+  # ===========================================================================
+  # Ollama LLM Service
+  # Runs the local language model server for AI-driven response generation.
+  # Automatically downloads llama3:8b on first startup via entrypoint script.
+  # ===========================================================================
+  ollama-service:
+    image: ollama/ollama:latest
+    container_name: aegistrap-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - aegistrap-net
+
+  # ===========================================================================
+  # AegisTrap Honeypot Application
+  # The main Python application running all honeypot services.
+  # Waits for Ollama to be healthy before starting.
+  # ===========================================================================
+  aegistrap-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aegistrap-honeypot
+    restart: unless-stopped
+    depends_on:
+      ollama-service:
+        condition: service_healthy
+    ports:
+      # SSH honeypot (maps host 22 to container 2222)
+      - "22:2222"
+      # Telnet honeypot
+      - "23:23"
+      # HTTP honeypot
+      - "80:80"
+      - "8080:8080"
+      # FTP honeypot
+      - "21:21"
+    volumes:
+      # Persist logs to host filesystem for SIEM ingestion
+      - ./logs:/app/logs
+      # SSH host key persistence (so key doesn't change on restart)
+      - ./data/ssh_host_key:/app/ssh_host_key
+    environment:
+      - OLLAMA_HOST=http://ollama-service:11434
+      - OLLAMA_MODEL=llama3:8b
+      - LOG_DIR=/app/logs
+      - SSH_PORT=2222
+      - TELNET_PORT=23
+      - HTTP_PORT=80
+      - HTTP_ALT_PORT=8080
+      - FTP_PORT=21
+    networks:
+      - aegistrap-net
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  ollama_models:
+    driver: local
+    name: aegistrap_ollama_models
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  aegistrap-net:
+    driver: bridge
+    name: aegistrap-network
