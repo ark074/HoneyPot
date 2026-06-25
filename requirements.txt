@@ -1,3 +1,32 @@
+# =============================================================================
+# AegisTrap - Python Dependencies
+# =============================================================================
+
+# Core Networking & Protocols
 asyncssh>=2.14.0
 aiohttp>=3.9.0
 aiofiles>=23.2.0
+
+# Dashboard API (FastAPI + WebSocket)
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# GeoIP Enrichment (MaxMind GeoLite2)
+geoip2>=4.8.0
+maxminddb>=2.5.0
+
+# YARA Malware Scanning
+yara-python>=4.5.0
+
+# Redis (caching, pub/sub)
+redis[hiredis]>=5.0.0
+
+# Elasticsearch (log shipping)
+elasticsearch[async]>=8.12.0
+
+# Prometheus Metrics (optional, metrics export works without this)
+# prometheus-client>=0.20.0
+
+# Utilities
+python-dateutil>=2.8.0

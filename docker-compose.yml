@@ -1,9 +1,13 @@
 ###############################################################################
-# AegisTrap - Docker Compose Orchestration
+# AegisTrap - Full-Stack Docker Compose Orchestration
 # 
-# Two microservices:
-# 1. ollama-service: Local LLM runtime (llama3:8b)
-# 2. aegistrap-app: Multi-service honeypot application
+# Services:
+# 1. ollama-service:    Local LLM runtime (llama3:8b)
+# 2. aegistrap-app:    Multi-service honeypot application
+# 3. redis:            Caching, pub/sub, session state
+# 4. elasticsearch:    Log storage and search (free/basic license)
+# 5. grafana:          Metrics visualization dashboards
+# 6. prometheus:       Metrics collection from honeypot
 #
 # Usage:
 #   docker-compose up -d          # Start all services
@@ -17,7 +21,7 @@ services:
   # ===========================================================================
   # Ollama LLM Service
   # Runs the local language model server for AI-driven response generation.
-  # Automatically downloads llama3:8b on first startup via entrypoint script.
+  # Automatically downloads llama3:8b on first startup.
   # ===========================================================================
   ollama-service:
     image: ollama/ollama:latest
@@ -47,9 +51,109 @@ services:
       - aegistrap-net
 
   # ===========================================================================
+  # Redis - In-Memory Cache & Pub/Sub
+  # Used for: response caching, session state, real-time event pub/sub,
+  # rate limiting counters, and inter-service communication.
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: aegistrap-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aegistrap-net
+
+  # ===========================================================================
+  # Elasticsearch - Log Storage & Search (Free/Basic License)
+  # Stores all honeypot interaction logs for analysis and querying.
+  # Compatible with Kibana for visualization (add separately if needed).
+  # ===========================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: aegistrap-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=aegistrap
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - aegistrap-net
+
+  # ===========================================================================
+  # Prometheus - Metrics Collection
+  # Scrapes /metrics endpoint from aegistrap-app for time-series monitoring.
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aegistrap-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      aegistrap-app:
+        condition: service_healthy
+    networks:
+      - aegistrap-net
+
+  # ===========================================================================
+  # Grafana - Visualization Dashboards
+  # Pre-configured with Prometheus datasource and AegisTrap dashboard.
+  # Access at http://localhost:3000 (admin:admin on first login)
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aegistrap-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=aegistrap
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - aegistrap-net
+
+  # ===========================================================================
   # AegisTrap Honeypot Application
-  # The main Python application running all honeypot services.
-  # Waits for Ollama to be healthy before starting.
+  # The main Python application running all honeypot services + dashboard API.
   # ===========================================================================
   aegistrap-app:
     build:
@@ -59,6 +163,10 @@ services:
     restart: unless-stopped
     depends_on:
       ollama-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
         condition: service_healthy
     ports:
       # SSH honeypot (maps host 22 to container 2222)
@@ -70,11 +178,17 @@ services:
       - "8080:8080"
       # FTP honeypot
       - "21:21"
+      # Dashboard API + WebSocket
+      - "9000:9000"
     volumes:
       # Persist logs to host filesystem for SIEM ingestion
       - ./logs:/app/logs
-      # SSH host key persistence (so key doesn't change on restart)
+      # SSH host key persistence
       - ./data/ssh_host_key:/app/ssh_host_key
+      # GeoIP databases
+      - ./data/geoip:/app/data/geoip:ro
+      # YARA rules
+      - ./data/yara_rules:/app/data/yara_rules:ro
     environment:
       - OLLAMA_HOST=http://ollama-service:11434
       - OLLAMA_MODEL=llama3:8b
@@ -84,6 +198,12 @@ services:
       - HTTP_PORT=80
       - HTTP_ALT_PORT=8080
       - FTP_PORT=21
+      - REDIS_URL=redis://redis:6379/0
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - DASHBOARD_PORT=9000
+      - GEOIP_CITY_DB=/app/data/geoip/GeoLite2-City.mmdb
+      - GEOIP_ASN_DB=/app/data/geoip/GeoLite2-ASN.mmdb
+      - YARA_RULES_DIR=/app/data/yara_rules
     networks:
       - aegistrap-net
 
@@ -94,6 +214,18 @@ volumes:
   ollama_models:
     driver: local
     name: aegistrap_ollama_models
+  redis_data:
+    driver: local
+    name: aegistrap_redis_data
+  es_data:
+    driver: local
+    name: aegistrap_es_data
+  prometheus_data:
+    driver: local
+    name: aegistrap_prometheus_data
+  grafana_data:
+    driver: local
+    name: aegistrap_grafana_data
 
 # =============================================================================
 # Networks

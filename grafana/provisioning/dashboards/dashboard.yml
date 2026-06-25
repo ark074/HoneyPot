@@ -1,0 +1,13 @@
+# Grafana Dashboard Provisioning
+apiVersion: 1
+
+providers:
+  - name: "AegisTrap"
+    orgId: 1
+    folder: "AegisTrap"
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
